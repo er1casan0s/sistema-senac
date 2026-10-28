@@ -1,3 +1,20 @@
+// Pega o token CSRF da meta tag do HTML
+const csrfToken = document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+
+// Configura o fetch para enviar o token automaticamente em todas as requisições
+const originalFetch = window.fetch;
+window.fetch = function() {
+    let [resource, config] = arguments;
+    
+    // Se for uma requisição que muda dados (POST, PUT, DELETE, PATCH), adiciona o token
+    if (config && config.method && ['POST', 'PUT', 'DELETE', 'PATCH'].includes(config.method.toUpperCase())) {
+        config.headers = config.headers || {};
+        config.headers['X-CSRFToken'] = csrfToken;
+    }
+    
+    return originalFetch(resource, config);
+};
+
 // ===== TABS =====
 document.querySelectorAll('.tab').forEach(btn => {
   btn.addEventListener('click', () => {
