@@ -3,7 +3,31 @@ from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 import sqlite3, os, uuid
 from datetime import datetime
+import os
+from cryptography.fernet import Fernet
+from dotenv import load_dotenv
 
+# Carrega o .env (caso rode localmente)
+load_dotenv()
+
+# Configura a chave
+FERNET_KEY = os.environ.get("FERNET_KEY")
+if not FERNET_KEY:
+    raise RuntimeError("A variável de ambiente FERNET_KEY não foi configurada!")
+
+fernet = Fernet(FERNET_KEY.encode())
+
+app.config.update(
+    SESSION_COOKIE_SECURE=True,      # Só envia o cookie se a conexão for HTTPS (PythonAnywhere já tem)
+    SESSION_COOKIE_HTTPONLY=True,    # Impede que o JavaScript leia o cookie (proteção contra XSS)
+    SESSION_COOKIE_SAMESITE='Lax',   # Ajuda a bloquear ataques CSRF básicos
+    PERMANENT_SESSION_LIFETIME=3600  # A sessão expira em 1 hora (3600 segundos)
+)
+
+# Inicializa a proteção CSRF globalmente
+csrf = CSRFProtect(app)
+
+# INICIO 
 app = Flask(__name__)
 app.secret_key = "senac2026_chave_secreta_super_segura"
 UPLOAD_FOLDER = "static/uploads"
@@ -78,6 +102,14 @@ def init_db():
         data TEXT NOT NULL,
         FOREIGN KEY(aluno_id) REFERENCES alunos(id)
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS logs_acesso (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    usuario_nome TEXT NOT NULL,
+    aluno_id INTEGER NOT NULL,
+    acao TEXT NOT NULL,
+    data TEXT NOT NULL,
+    ip TEXT
+    )""")
     
     conn.commit()
     conn.close()
@@ -94,7 +126,7 @@ def get_db():
 def proteger():
     rotas_livres = ["login", "static", "logout"]
     if request.endpoint and request.endpoint not in rotas_livres:
-        if not session.get("logado"):
+        if not session.get("usuario_id"):   # ajuste para a chave que você usa
             return redirect(url_for("login"))
 
 # ===== ROTAS =====
@@ -142,8 +174,9 @@ def api_alunos():
     turno = request.args.get("turno", "").strip()
 
     # Query que junta os dados do aluno com a contagem de ocorrências
-    sql = """
-        SELECT a.*, COUNT(o.id) as total_ocorrencias 
+     sql = """
+        SELECT a.id, a.nome, a.turma, a.turno, a.foto, a.criado_em,
+               COUNT(o.id) as total_ocorrencias 
         FROM alunos a
         LEFT JOIN ocorrencias o ON a.id = o.aluno_id
         WHERE 1=1
@@ -209,9 +242,31 @@ def get_aluno(aid):
     conn = get_db()
     row = conn.execute("SELECT * FROM alunos WHERE id = ?", (aid,)).fetchone()
     conn.close()
+    
     if not row:
         return jsonify({"erro": "Aluno não encontrado"}), 404
-    return jsonify(dict(row))
+        
+    # Transforma a linha do banco em um dicionário
+    aluno = dict(row)
+    
+    # Descriptografa os campos sensíveis
+    if aluno.get("especificidade"):
+        try:
+            aluno["especificidade"] = fernet.decrypt(aluno["especificidade"].encode()).decode()
+        except Exception:
+            pass # Se der erro (ex: dado antigo em texto puro), mantém como está
+            
+    if aluno.get("observacoes_medicas"):
+        try:
+            aluno["observacoes_medicas"] = fernet.decrypt(aluno["observacoes_medicas"].encode()).decode()
+        except Exception:
+            pass
+
+    # Retorna o aluno com os dados legíveis
+    return jsonify(aluno)
+    
+
+
 
 @app.route("/api/alunos/<int:aid>", methods=["PUT"])
 def atualizar_aluno(aid):
@@ -219,12 +274,18 @@ def atualizar_aluno(aid):
     conn = get_db()
     
     # Atualiza os dados
+      # Criptografa os campos sensíveis
+    especificidade_cripto = fernet.encrypt(data.get("especificidade", "").encode()).decode()
+    observacoes_cripto = fernet.encrypt(data.get("observacoes_medicas", "").encode()).decode()
+
     conn.execute("""UPDATE alunos SET 
         data_nascimento=?, nome_responsavel=?, telefone_responsavel=?, 
         especificidade=?, observacoes_medicas=? WHERE id=?""",
         (data.get("data_nascimento", ""), data.get("nome_responsavel", ""), 
-         data.get("telefone_responsavel", ""), data.get("especificidade", ""), 
-         data.get("observacoes_medicas", ""), aid))
+         data.get("telefone_responsavel", ""), 
+         especificidade_cripto, 
+         observacoes_cripto, 
+         aid))
     
     conn.commit()
     conn.close()
@@ -235,16 +296,20 @@ def atualizar_aluno(aid):
 @app.route("/api/ocorrencias", methods=["POST"])
 def registrar_ocorrencia():
     data = request.get_json()
+    registrado_por = session.get("nome_usuario")
+    if not registrado_por:
+        return jsonify({"erro": "Sessão expirada"}), 401
+
     conn = get_db()
     conn.execute("""INSERT INTO ocorrencias 
         (aluno_id, codigo, descricao, registrado_por, data)
         VALUES (?,?,?,?,?)""",
         (data["aluno_id"], data["codigo"], data.get("descricao", ""),
-         data["registrado_por"], datetime.now().strftime("%d/%m/%Y %H:%M")))
+         registrado_por, datetime.now().strftime("%d/%m/%Y %H:%M")))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
-
+    
 @app.route("/api/ocorrencias/<int:aluno_id>")
 def listar_ocorrencias(aluno_id):
     conn = get_db()
@@ -301,6 +366,17 @@ def deletar_turma(tid):
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
+
+@app.route("/api/logs/<int:aluno_id>")
+def logs_aluno(aluno_id):
+    if session.get("perfil") != "coordenador":
+        return jsonify({"erro": "Sem permissão"}), 403
+    conn = get_db()
+    rows = conn.execute("""SELECT usuario_nome, acao, data, ip 
+                           FROM logs_acesso WHERE aluno_id = ? 
+                           ORDER BY id DESC""", (aluno_id,)).fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
 
 
 if __name__ == "__main__":
